@@ -36,7 +36,7 @@ Filling incrementally. `—` = not yet measured. TTFT marked ⚠ until the promp
 | AR baseline (ladder) | Qwen3-0.6B | q4f16 | 0.20 | **50.6** | ~30 s | JS-heap ~70 MB¹ | coherent | — | n/a | ✅ (transformers.js) |
 | AR baseline (ladder) | Qwen3-1.7B | q4f16 | 0.71 | **15.2** (17.4 decode) | ~60 s | —¹ | coherent | — | n/a | ✅ (raw ORT@1.26.0 loader) |
 | AR baseline (ladder) | Qwen3-4B | q4f16 | 1.0 | **9.2** (10.5 decode) | ~122 s | —¹ | coherent | — | n/a | ✅ (raw ORT, 2.77 GB / 2 chunks) |
-| AR baseline (ladder) | Qwen3-8B | q4f16 | — | — | — | — | — | — | n/a | ⏳ ceiling test (~4.5 GB) |
+| AR baseline (ladder) | Qwen3-8B | q4f16 | — | — | — | — | — | — | n/a | ⛔ needs conversion (onnx-community 8B is ORT-GenAI int4 / 6GB-single-file, not flat q4f16) |
 | AR baseline | Gemma4 E4B(-QAT) | — | — | — | — | — | — | — | n/a | — |
 | AR+MTP | E4B-QAT+drafter | — | — | — | — | — | — | — | n/a | — |
 | Sparse MoE AR | LFM2.5-8B-A1B | — | — | — | — | — | — | — | n/a | — |
@@ -55,3 +55,15 @@ Filling incrementally. `—` = not yet measured. TTFT marked ⚠ until the promp
 - **2026-06-12** · `run-one-ort.html` (raw ORT@1.26.0 AR KV-cache loop) · Qwen3-1.7B q4f16 · max 80, /no_think → **coherent** ("The sky appears blue because of the way sunlight interacts…") · **15.2 tok/s** (17.4 decode) · **TTFT 0.71 s** · cold load ~60 s · arch auto-read 28L/8kv/headdim128. Empty `<think></think>` confirms /no_think works; stripped in post.
 - **2026-06-12** · Qwen3-4B q4f16 · **first attempt FAILED** — `Failed to load external data file "model_q4f16.onnx_data_1" … not found in preloaded files`. 4B q4f16 is **multi-chunk** external data (`.onnx_data` 2.10 GB + `.onnx_data_1` 677 MB); the loader only registered chunk 0. → fixed `run-one-ort.html` to enumerate + register all chunks (`_data`, `_data_1`, …).
 - **2026-06-12** · Qwen3-4B q4f16 (2.77 GB / 2 chunks) · after multi-chunk fix → **coherent** ("…shorter wavelengths of light, like blue, are scattered more efficiently…") · **9.2 tok/s** (10.5 decode) · **TTFT 1.0 s** · cold load 122 s · 36L/8kv/headdim128. Loader generalizes to multi-chunk big models (the shape T1/T2/T3 need).
+- **2026-06-12** · Qwen3-8B · **BLOCKED on packaging, not memory** — `AutoTokenizer.from_pretrained` threw `tokenizer_class of undefined` (tokenizer is in a subfolder). `onnx-community/Qwen3-8B-ONNX` is the **ORT-GenAI** layout: `onnxruntime/webgpu/webgpu-int4-kld-block-32/{model.onnx, model.onnx.data(6.0 GB), tokenizer*}` — int4-kld (not q4f16), a **single 6 GB** data file (trips the 2 GB ArrayBuffer cap), GenAI-format graph. Not a drop-in. The real q4f16 ceiling test needs a **conversion** (Studio: export Qwen3-8B → q4f16 MatMulNBits ONNX, multi-chunk external data, matching the smaller rungs). The memory ceiling question (does ~4.5 GB load) remains OPEN.
+
+### Dense AR ladder so far (q4f16, Metal-3 WebGPU)
+
+| rung | tok/s | decode tok/s | TTFT | cold load | backend |
+|---|---|---|---|---|---|
+| 0.6B | 50.6 | — | 0.20 s | ~30 s | transformers.js |
+| 1.7B | 15.2 | 17.4 | 0.71 s | ~60 s | raw ORT@1.26.0 |
+| 4B | 9.2 | 10.5 | 1.0 s | ~122 s | raw ORT@1.26.0 (2.77 GB) |
+| 8B | — | — | — | — | needs q4f16 conversion |
+
+Clean memory-bandwidth scaling: bigger = slower (50→15→9 tok/s), TTFT and cold-load climb with size. This is the AR-baseline curve the MoE/MTP/diffusion modes get compared against.
