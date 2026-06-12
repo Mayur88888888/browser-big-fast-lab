@@ -35,8 +35,8 @@ Filling incrementally. `—` = not yet measured. TTFT marked ⚠ until the promp
 |---|---|---|---|---|---|---|---|---|---|---|
 | AR baseline (ladder) | Qwen3-0.6B | q4f16 | 0.20 | **50.6** | ~30 s | JS-heap ~70 MB¹ | coherent | — | n/a | ✅ (transformers.js) |
 | AR baseline (ladder) | Qwen3-1.7B | q4f16 | 0.71 | **15.2** (17.4 decode) | ~60 s | —¹ | coherent | — | n/a | ✅ (raw ORT@1.26.0 loader) |
-| AR baseline (ladder) | Qwen3-4B | q4f16 | — | — | — | — | — | — | n/a | — |
-| AR baseline (ladder) | Qwen3-8B | q4f16 | — | — | — | — | — | — | n/a | — |
+| AR baseline (ladder) | Qwen3-4B | q4f16 | 1.0 | **9.2** (10.5 decode) | ~122 s | —¹ | coherent | — | n/a | ✅ (raw ORT, 2.77 GB / 2 chunks) |
+| AR baseline (ladder) | Qwen3-8B | q4f16 | — | — | — | — | — | — | n/a | ⏳ ceiling test (~4.5 GB) |
 | AR baseline | Gemma4 E4B(-QAT) | — | — | — | — | — | — | — | n/a | — |
 | AR+MTP | E4B-QAT+drafter | — | — | — | — | — | — | — | n/a | — |
 | Sparse MoE AR | LFM2.5-8B-A1B | — | — | — | — | — | — | — | n/a | — |
@@ -53,3 +53,5 @@ Filling incrementally. `—` = not yet measured. TTFT marked ⚠ until the promp
 - **2026-06-12** · memory probe (fresh renderer): cumulative ArrayBuffers 0.5+1+1.33+1.5 GB = 4.33 GB OK; single 2 GB → `RangeError`; `jsHeapSizeLimit` 4 GB; `deviceMemory` 8. → renderer/GPU not the bottleneck; wasm heap is.
 - **2026-06-12** · `ort-load-probe.html` · Qwen3-1.7B q4f16 · raw `onnxruntime-web@1.26.0` → **session CREATED ✅** in 59.7 s. Same embedded file that bad_alloc'd under transformers.js. I/O = decoder-with-past, 28 layers. → the wall was the ORT version, not the model.
 - **2026-06-12** · `run-one-ort.html` (raw ORT@1.26.0 AR KV-cache loop) · Qwen3-1.7B q4f16 · max 80, /no_think → **coherent** ("The sky appears blue because of the way sunlight interacts…") · **15.2 tok/s** (17.4 decode) · **TTFT 0.71 s** · cold load ~60 s · arch auto-read 28L/8kv/headdim128. Empty `<think></think>` confirms /no_think works; stripped in post.
+- **2026-06-12** · Qwen3-4B q4f16 · **first attempt FAILED** — `Failed to load external data file "model_q4f16.onnx_data_1" … not found in preloaded files`. 4B q4f16 is **multi-chunk** external data (`.onnx_data` 2.10 GB + `.onnx_data_1` 677 MB); the loader only registered chunk 0. → fixed `run-one-ort.html` to enumerate + register all chunks (`_data`, `_data_1`, …).
+- **2026-06-12** · Qwen3-4B q4f16 (2.77 GB / 2 chunks) · after multi-chunk fix → **coherent** ("…shorter wavelengths of light, like blue, are scattered more efficiently…") · **9.2 tok/s** (10.5 decode) · **TTFT 1.0 s** · cold load 122 s · 36L/8kv/headdim128. Loader generalizes to multi-chunk big models (the shape T1/T2/T3 need).

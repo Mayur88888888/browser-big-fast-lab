@@ -97,10 +97,21 @@ async function run() {
     const ort = await import(`https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORTV}/dist/ort.webgpu.min.mjs`);
 
     const opts = { executionProviders: ['webgpu'], graphOptimizationLevel: OPT };
+    // External data can be MULTI-CHUNK once weights exceed the 2GB protobuf limit:
+    // <name>.onnx_data (chunk 0), <name>.onnx_data_1, _2, … (4B+/big models). Register ALL,
+    // each `path` matching the basename the proto records. (run-one.html's transformers.js
+    // path handles this internally; here we do it by hand.)
     const base = u.onnx.split('/').pop();
-    for (const sfx of ['.data', '_data']) {
-      try { if ((await fetch(u.onnx + sfx, { method: 'HEAD' })).ok) { opts.externalData = [{ path: base + sfx, data: u.onnx + sfx }]; break; } } catch {}
+    const externalData = [];
+    const HEADok = async (url) => { try { return (await fetch(url, { method: 'HEAD' })).ok; } catch { return false; } };
+    for (const sfx of ['_data', '.data']) {
+      if (await HEADok(u.onnx + sfx)) {
+        externalData.push({ path: base + sfx, data: u.onnx + sfx });
+        for (let n = 1; await HEADok(`${u.onnx}${sfx}_${n}`); n++) externalData.push({ path: `${base}${sfx}_${n}`, data: `${u.onnx}${sfx}_${n}` });
+        break;
+      }
     }
+    if (externalData.length) { opts.externalData = externalData; log(`external data: ${externalData.length} chunk(s)`, 'dim'); }
     const tLoad = performance.now();
     const session = await ort.InferenceSession.create(u.onnx, opts);
     result.loadSec = +((performance.now() - tLoad) / 1000).toFixed(1);
