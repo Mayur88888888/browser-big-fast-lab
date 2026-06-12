@@ -10,6 +10,7 @@ Thumbs.db
 
 # Python / uv (export + train tooling)
 .venv/
+.venv-onnx/
 __pycache__/
 *.pyc
 

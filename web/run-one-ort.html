@@ -32,6 +32,12 @@ const MAXNEW = +(p.get('max') ?? 96);
 const THINK  = p.get('think') === '1';
 const ORTV   = p.get('ort') ?? '1.26.0';
 const OPT    = p.get('opt') ?? 'disabled';
+// ?tok= overrides the tokenizer repo — lets a self-served .onnx (e.g. a Studio-exported 8B served
+// from :8131) borrow its identical tokenizer straight from an HF repo, instead of from the served root.
+const TOK    = p.get('tok');
+// ?kv=fp16|fp32 — KV-cache (past_key_values) dtype. q4f16 models use fp16; a q4 model with fp32
+// residuals (quantized without float16 conversion) needs fp32 KV. Must match the model's I/O.
+const KV     = p.get('kv') ?? 'fp16';
 
 // Resolve a repo id ('onnx-community/Qwen3-1.7B-ONNX') to its onnx/config/tokenizer URLs;
 // a full '...model_X.onnx' URL is used as-is (tokenizer/config inferred from the repo root).
@@ -93,7 +99,7 @@ async function run() {
     result.arch = { layers: L, kvHeads: Hkv, headDim, vocab: cfg.vocab_size };
     log(`arch:   ${L} layers · ${Hkv} kv-heads · head_dim ${headDim}`, 'dim');
 
-    const tok = await AutoTokenizer.from_pretrained(u.repo);
+    const tok = await AutoTokenizer.from_pretrained(TOK ?? u.repo);
     const ort = await import(`https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORTV}/dist/ort.webgpu.min.mjs`);
 
     const opts = { executionProviders: ['webgpu'], graphOptimizationLevel: OPT };
@@ -103,15 +109,20 @@ async function run() {
     // path handles this internally; here we do it by hand.)
     const base = u.onnx.split('/').pop();
     const externalData = [];
-    const HEADok = async (url) => { try { return (await fetch(url, { method: 'HEAD' })).ok; } catch { return false; } };
+    let weightBytes = 0;
+    // HEAD returns {ok,size} so we can sum external-data bytes = the quantized weights ORT uploads
+    // to GPU buffers (the dominant, deterministic term of the GPU memory high-water; see result.gpu*).
+    const HEAD = async (url) => { try { const r = await fetch(url, { method: 'HEAD' }); return { ok: r.ok, size: +(r.headers.get('content-length') || 0) }; } catch { return { ok: false, size: 0 }; } };
     for (const sfx of ['_data', '.data']) {
-      if (await HEADok(u.onnx + sfx)) {
-        externalData.push({ path: base + sfx, data: u.onnx + sfx });
-        for (let n = 1; await HEADok(`${u.onnx}${sfx}_${n}`); n++) externalData.push({ path: `${base}${sfx}_${n}`, data: `${u.onnx}${sfx}_${n}` });
+      const h0 = await HEAD(u.onnx + sfx);
+      if (h0.ok) {
+        externalData.push({ path: base + sfx, data: u.onnx + sfx }); weightBytes += h0.size;
+        for (let n = 1; ; n++) { const h = await HEAD(`${u.onnx}${sfx}_${n}`); if (!h.ok) break; externalData.push({ path: `${base}${sfx}_${n}`, data: `${u.onnx}${sfx}_${n}` }); weightBytes += h.size; }
         break;
       }
     }
-    if (externalData.length) { opts.externalData = externalData; log(`external data: ${externalData.length} chunk(s)`, 'dim'); }
+    if (externalData.length) { opts.externalData = externalData; log(`external data: ${externalData.length} chunk(s) · ${(weightBytes/1048576).toFixed(0)} MB weights`, 'dim'); }
+    if (!weightBytes) { weightBytes = (await HEAD(u.onnx)).size; }  // embedded-weight models (≤~1.5GB): weights live inside model.onnx
     const tLoad = performance.now();
     const session = await ort.InferenceSession.create(u.onnx, opts);
     result.loadSec = +((performance.now() - tLoad) / 1000).toFixed(1);
@@ -122,12 +133,15 @@ async function run() {
     const promptIds = [...tok(full, { add_special_tokens: false }).input_ids.data].map(Number);
     const P = promptIds.length;
 
-    // empty fp16 KV cache: past_key_values.{l}.{key,value} = [1, Hkv, 0, headDim]
+    // empty KV cache: past_key_values.{l}.{key,value} = [1, Hkv, 0, headDim], dtype per ?kv=
+    const kvType = KV === 'fp32' ? 'float32' : 'float16';
+    const KVArr  = KV === 'fp32' ? Float32Array : Uint16Array;
+    const kvBytes = KV === 'fp32' ? 4 : 2;
     const emptyPast = () => {
       const f = {};
       for (let l = 0; l < L; l++) {
-        f[`past_key_values.${l}.key`]   = new ort.Tensor('float16', new Uint16Array(0), [1, Hkv, 0, headDim]);
-        f[`past_key_values.${l}.value`] = new ort.Tensor('float16', new Uint16Array(0), [1, Hkv, 0, headDim]);
+        f[`past_key_values.${l}.key`]   = new ort.Tensor(kvType, new KVArr(0), [1, Hkv, 0, headDim]);
+        f[`past_key_values.${l}.value`] = new ort.Tensor(kvType, new KVArr(0), [1, Hkv, 0, headDim]);
       }
       return f;
     };
@@ -177,6 +191,12 @@ async function run() {
       tokS: +(generated.length / dt).toFixed(1),
       decodeTokS: generated.length > 1 ? +((generated.length - 1) / decodeS).toFixed(1) : null,
       jsHeapMB: performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : null,
+      // Analytic GPU memory high-water (deterministic; WebGPU exposes no memory API). Weights =
+      // external-data bytes uploaded to GPU buffers; KV = fp16 cache at peak sequence length.
+      gpuWeightsMB: weightBytes ? Math.round(weightBytes / 1048576) : null,
+      gpuKVPeakMB: Math.round(L * 2 * Hkv * headDim * (P + generated.length) * kvBytes / 1048576),
+      gpuTotalMB: weightBytes ? Math.round((weightBytes + L * 2 * Hkv * headDim * (P + generated.length) * kvBytes) / 1048576) : null,
+      peakSeqLen: P + generated.length,
       completion: text.trim(),
     });
     log(`\nload ${result.loadSec}s · TTFT ${result.ttft}s · ${result.tokens} tok · ${result.genSec}s · ${result.tokS} tok/s (decode ${result.decodeTokS})`, 'dim');
