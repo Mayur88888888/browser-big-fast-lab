@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>raw ORT-web load probe — does session creation clear the wasm wall?</title>
+<style>
+  body { background:#14161a; color:#e8e6e3; font:14px/1.6 ui-monospace, Menlo, monospace; margin:24px; max-width:900px; }
+  pre { background:#1b1e25; border:1px solid #2a2e37; border-radius:8px; padding:14px; white-space:pre-wrap; word-break:break-word; }
+  .ok { color:#9ece6a; } .bad { color:#f7768e; } .dim { color:#8a8f98; } .warn { color:#e0af68; }
+</style>
+</head>
+<body>
+<h3>raw ORT-web load probe <span class="dim">— isolate the memory wall: does session CREATION succeed?</span></h3>
+<pre id="out">starting…</pre>
+
+<script type="module">
+// The transformers.js pipeline bad_alloc'd creating a session for the 1.33GB embedded
+// Qwen3-1.7B q4f16. kohra loads 1.4GB and indira 5.3GB via RAW onnxruntime-web@1.26.0 +
+// external data. This probe isolates the variable that matters first — session creation
+// alone (no AR decode loop yet) — and dumps the model's I/O signature so the AR loop can
+// be written against real names. Params:
+//   ?model=<full .onnx URL>   ?ort=<npm version>   ?opt=<graphOptimizationLevel>
+const p = new URLSearchParams(location.search);
+const MODEL = p.get('model') ?? 'https://huggingface.co/onnx-community/Qwen3-1.7B-ONNX/resolve/main/onnx/model_q4f16.onnx';
+const ORTV  = p.get('ort')   ?? '1.26.0';
+const OPT   = p.get('opt')   ?? 'disabled';
+
+const out = document.getElementById('out');
+const log = (s, cls) => { out.innerHTML += `\n${cls ? `<span class="${cls}">${s}</span>` : s}`; };
+
+(async () => {
+  const r = { model: MODEL, ortVersion: ORTV, opt: OPT };
+  out.textContent = `model: ${MODEL}\nort:   onnxruntime-web@${ORTV} (ort.webgpu)\nopt:   ${OPT}`;
+  try {
+    if (!navigator.gpu) { log('No WebGPU.', 'bad'); window.__probe = r; window.__done = true; return; }
+
+    const tImp = performance.now();
+    const ort = await import(`https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORTV}/dist/ort.webgpu.min.mjs`);
+    r.importSec = +((performance.now() - tImp) / 1000).toFixed(1);
+    log(`imported ort in ${r.importSec}s`, 'dim');
+
+    // external-data detection (kohra pattern): the proto records the data file's basename.
+    const opts = { executionProviders: ['webgpu'], graphOptimizationLevel: OPT };
+    const base = MODEL.split('/').pop();
+    for (const suffix of ['.data', '_data']) {
+      try {
+        const dataUrl = MODEL + suffix;
+        if ((await fetch(dataUrl, { method: 'HEAD' })).ok) {
+          opts.externalData = [{ path: base + suffix, data: dataUrl }];
+          r.externalData = base + suffix;
+          log(`external data: ${base + suffix}`, 'dim');
+          break;
+        }
+      } catch { /* none */ }
+    }
+    if (!r.externalData) log('external data: none (embedded weights)', 'dim');
+
+    log('creating session… (this is exactly what bad_alloc\'d under transformers.js)', 'dim');
+    const tCreate = performance.now();
+    const session = await ort.InferenceSession.create(MODEL, opts);
+    r.createSec = +((performance.now() - tCreate) / 1000).toFixed(1);
+    r.inputNames = session.inputNames;
+    r.outputNames = session.outputNames;
+    r.created = true;
+    window.__session = session; window.__ort = ort;
+    log(`\nSESSION CREATED ✅ in ${r.createSec}s — the wasm wall is CLEARED on this path`, 'ok');
+    log(`\ninputs (${r.inputNames.length}):  ${r.inputNames.join(', ')}`, 'dim');
+    log(`outputs (${r.outputNames.length}): ${r.outputNames.join(', ')}`, 'dim');
+  } catch (e) {
+    r.created = false;
+    r.error = String(e?.message ?? e);
+    log('\nSESSION CREATE FAILED ❌  ' + r.error, 'bad');
+    log('→ embedded-weight q4 still blocked on raw ORT too; need external-data re-export (Studio).', 'warn');
+  }
+  window.__probe = r;
+  window.__done = true;
+})();
+</script>
+</body>
+</html>
