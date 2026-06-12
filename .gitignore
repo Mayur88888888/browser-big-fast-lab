@@ -1,0 +1,27 @@
+# local working notes (plan-folder convention — never committed)
+plan/
+
+# OS junk
+.DS_Store
+Thumbs.db
+._*
+.Spotlight-V100
+.Trashes
+
+# Python / uv (export + train tooling)
+.venv/
+__pycache__/
+*.pyc
+
+# node (browser harness)
+node_modules/
+
+# heavy model artifacts (exports live on HF / the Studio, not git)
+*.onnx
+*.onnx_data
+onnx-out/
+onnx-sym/
+fused/
+fused-hf/
+*.gguf
+*.safetensors
