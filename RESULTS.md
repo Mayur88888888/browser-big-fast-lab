@@ -68,30 +68,47 @@ Filling incrementally. `—` = not yet measured. TTFT marked ⚠ until the promp
 
 Clean memory-bandwidth scaling: bigger = slower (50→15→9 tok/s), TTFT and cold-load climb with size. This is the AR-baseline curve the MoE/MTP/diffusion modes get compared against.
 
-## T6 — Custom-WGSL kernel backend (the speed frontier) — NEW, not yet measured
+## T6 — Custom-WGSL kernel backend (the speed frontier) — MEASURED 2026-06-27
 
-A second backend arrived from outside this lab: **hand-written WGSL inference engines**
-(webml-community / Xenova lineage), validated in LocalMind at **Gemma 4 E2B ~250 tok/s**
-and **LFM2.5 230M ~1,000 tok/s** on this same Metal-3 — i.e. **5–30× the ORT-web ladder
-above**. This obsoletes the handoff's "do not build custom kernels" line (decided when q4
-looked broken; the new move is to **fork a proven Apache-2.0 engine**, not build one). The
-fork lives in [`custom-kernels/`](custom-kernels/) (branch `qwen3-spike`, see its `PHASE0.md`).
+A second backend: **hand-written WGSL inference engine**, raw WebGPU, **no ORT, no wasm**.
+Forked `tylerstraub/gemma4-webgpu` (Apache-2.0, webml-community/Xenova lineage) into
+[`custom-kernels/`](custom-kernels/) (branch `qwen3-spike`) and **generalised it to Qwen3**
+(see [the port commit](custom-kernels/) — an `arch: gemma4|qwen3` discriminator + 8 deltas).
+Obsoletes the handoff's "do not build custom kernels" line; **rewriting/extending kernels is
+on the agenda.**
 
-**The decisive tradeoff (memory):**
-- The forkable engine (`tylerstraub/gemma4-webgpu`) is **F16-everywhere** — weights
-  dequantized to F16 on GPU. A 4B model ≈ **8 GB GPU** (> the lab's 8B-q4 at 5.36 GB!).
-  → **the speed frontier at ≤~3B**, *not* a "big" play in the sidecar slice.
-- The LFM2 engine keeps weights **in-shader q4/q8** (memory-efficient, like ORT's
-  `MatMulNBits` but hand-written + faster) — but it's **minified-only** (no forkable source).
-- So "**big AND fast** custom kernels" = port in-shader-q4 into the forkable framework
-  (LFM2 bundle + ORT `MatMulNBits` as references). The headline roadmap item if speed lands.
+### Environment (differs from the ORT rows above)
 
-**Decider experiment (run first):** custom-kernel **Qwen3-1.7B / 4B tok/s vs the ORT
-baselines (15.2 / 9.2)** on this machine. 1.7B fits F16 cleanly; 4B may exceed the slice
-(expected caveat row). One number decides whether T6 is worth pursuing.
+| | |
+|---|---|
+| Backend | Pure **TypeScript + raw WebGPU (WGSL)**. No onnxruntime, **no wasm heap** — GGUF weights stream over HTTP Range → CPU-dequant to F16 → straight into GPU storage buffers. |
+| Weight layout | **F16-everywhere on GPU** (any source quant dequantized once at load). One matmul path; memory-heavy (a 4B model ≈ 8 GB GPU). |
+| Tuning | `apple-m-series` profile auto-selected (engine also ships `nvidia-blackwell`, `generic`). |
+| Harness | `custom-kernels/` workbench (`/workbench.html`, `window.lab`), Vite dev `127.0.0.1:5175`. Driven via chrome-devtools MCP `evaluate_script`. |
+| Metric | `lab.bench(prompt,{maxTokens,runs})` → **pure-decode tok/s** = `(tokens-1)/(coreDecodeMs/1000)`, excludes TTFT and caller-body time (methodology-matched to the engine's `runBench`). |
+| Configs | **short** = prompt "Hello, how are you?", maxTokens 64. **long** = default raven/crow prompt, maxTokens 200. Distinct workloads — `attnScore` is O(seqLen)/token, so long ≠ short. Warm one run before measuring. |
+| Same machine | Identical Metal-3 laptop as the ORT rows → **apples-to-apples on hardware**, different runtime. |
 
-| Mode | Model | dtype | tok/s | mem peak | in-browser today? |
-|---|---|---|---|---|---|
-| Custom-WGSL (T6) | Qwen3-1.7B | F16 (custom) | — *(vs ORT 15.2)* | ~3.4 GB F16 | spike — `custom-kernels/`, not yet wired |
-| Custom-WGSL (T6) | Qwen3-4B | F16 (custom) | — *(vs ORT 9.2)* | ~8 GB F16 ⚠ | spike — may exceed slice |
-| Custom-WGSL (T6) | Gemma 4 E2B | GGUF→F16 | ~250 (LocalMind) | ~4 GB F16 | ✅ the fork's native model |
+### Result — coherent, ~2.5× the ORT-web ladder (NOT the 5–30× the handoff claimed)
+
+| Model | dtype | tok/s (long / short) | TTFT | vs ORT | cold load | mem (F16 GPU) | coherent? |
+|---|---|---|---|---|---|---|---|
+| Qwen3-1.7B | GGUF q4_k_m → F16 | **43.3 / 35.6** | ~0.25–0.46 s | **2.4–2.9×** (ORT 15.2) | 65 s (1.1 GB) | ~3.4 GB | ✅ ("…is **Paris**.") |
+| Qwen3-4B | GGUF q4_k_m → F16 | **~23 / 7.7¹** | ~0.9 s | **2.5×** (ORT 9.2) | 125 s (2.5 GB) | ~8 GB **(fits 24 GB laptop, no OOM)** | ✅ ("…corvids, part of the family…") |
+| Gemma 4 E2B (native) | GGUF q4_k_m → F16 | **26.3 / 25.4** | ~0.3 s | — (baseline proxy) | 173 s (3.1 GB) | ~4 GB | ✅ |
+
+¹ 4B short cfg = 7.7 is a prefill-amortization artifact; GPU-timestamp profile (43.6 ms/token = 22.9 tok/s) confirms the long number is the true steady-state.
+
+**Per-kernel forward profile** (GPU timestamps): 1.7B forward = 22.9 ms/tok, 4B = 43.6 ms/tok. Both dominated by **core matmuls Qwen3 shares with ORT** — FFN gate/up 40–44%, FFN down 14–17%, QKV 14–15%, lmHead 9–15%. So the ~2.5× is the **engine** (F16-everywhere, fused norm+rope, one matmul path), not Gemma-overhead removal.
+
+**Why the handoff said "5–30×":** that was a **Blackwell-NVIDIA** measurement mis-attributed to this Apple laptop (the engine's `nvidia-blackwell` tuning profile is the tell). Benched here, Gemma E2B = 25.4 tok/s — 10× below the claimed ~250. **~2.5× is the true Apple-Metal-3 frontier.**
+
+**Correctness:** gated by coherent multi-prompt generation (greedy). The decisive port bug — Gemma hardcodes attention `scaling=1.0`; Qwen3 needs `1/√head_dim`, else softmax over-sharpens → degenerate repetition. **Rigorous `crossLabDiff` vs a Qwen3 PyTorch reference is still owed before any publish claim.**
+
+**The memory tradeoff (unchanged):** F16-everywhere = fast but heavy. 4B = ~8 GB F16 (fits the 24 GB laptop). **8B F16 ≈ 16 GB → likely OOM** → the **"big AND fast" lever is in-shader q4/q8** (keep weights quantized in GPU like ORT `MatMulNBits` / the LFM2 minified engine) — the headline kernel-rewrite item, and the path to the **4–8 GB-class sweet spot** at reasonable memory.
+
+### Custom-WGSL raw run log (what we did to get there)
+
+- **2026-06-27** · Gemma 4 E2B (engine-native) · GGUF q4_k_m→F16 · `lab.bench('Hello…',64,runs3)` + default/200 · **25.4 short / 26.3 long tok/s** (runs 25.37–25.43, rock-stable) · load 173 s (3.1 GB, PLE stream dominates). *Purpose: same-machine proxy decider before porting — revealed the handoff's ~250 was Blackwell, not Apple.* Profile: forward 37.3 ms/tok, FFN gate/up 47%, lmHead 13.8%, PLE ~6–7%.
+- **2026-06-27** · Qwen3-1.7B · GGUF q4_k_m→F16 (Unsloth) · first run after port → **degenerate** ("is the model of the model…") at 44.9 tok/s → diagnosed over-sharp softmax → **fixed attention scaling to 1/√head_dim** → re-ran **coherent** ("The capital of France is Paris."). Bench: **43.3 long / 35.6 short tok/s**, TTFT 0.25–0.46 s, tied embeddings, load 65 s.
+- **2026-06-27** · Qwen3-4B · GGUF q4_k_m→F16 (Unsloth) · added untied-LM-head plumbing (this GGUF actually ties) · loaded **~8 GB F16 with no OOM** on the 24 GB laptop · **coherent** ("…Both are corvids, part of the family…") · **~23 tok/s long** (GPU-profile 43.6 ms/tok agrees) · TTFT ~0.9 s · load 125 s (2.5 GB).
