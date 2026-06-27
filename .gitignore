@@ -17,6 +17,10 @@ __pycache__/
 # node (browser harness)
 node_modules/
 
+# T6 custom-WGSL kernel backend — a fork of tylerstraub/gemma4-webgpu with its
+# own git history (branch qwen3-spike). Tracked there, not in the lab repo.
+custom-kernels/
+
 # heavy model artifacts (exports live on HF / the Studio, not git)
 *.onnx
 *.onnx_data

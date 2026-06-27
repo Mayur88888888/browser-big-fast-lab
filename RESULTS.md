@@ -67,3 +67,31 @@ Filling incrementally. `—` = not yet measured. TTFT marked ⚠ until the promp
 | 8B | — | — | — | — | needs q4f16 conversion |
 
 Clean memory-bandwidth scaling: bigger = slower (50→15→9 tok/s), TTFT and cold-load climb with size. This is the AR-baseline curve the MoE/MTP/diffusion modes get compared against.
+
+## T6 — Custom-WGSL kernel backend (the speed frontier) — NEW, not yet measured
+
+A second backend arrived from outside this lab: **hand-written WGSL inference engines**
+(webml-community / Xenova lineage), validated in LocalMind at **Gemma 4 E2B ~250 tok/s**
+and **LFM2.5 230M ~1,000 tok/s** on this same Metal-3 — i.e. **5–30× the ORT-web ladder
+above**. This obsoletes the handoff's "do not build custom kernels" line (decided when q4
+looked broken; the new move is to **fork a proven Apache-2.0 engine**, not build one). The
+fork lives in [`custom-kernels/`](custom-kernels/) (branch `qwen3-spike`, see its `PHASE0.md`).
+
+**The decisive tradeoff (memory):**
+- The forkable engine (`tylerstraub/gemma4-webgpu`) is **F16-everywhere** — weights
+  dequantized to F16 on GPU. A 4B model ≈ **8 GB GPU** (> the lab's 8B-q4 at 5.36 GB!).
+  → **the speed frontier at ≤~3B**, *not* a "big" play in the sidecar slice.
+- The LFM2 engine keeps weights **in-shader q4/q8** (memory-efficient, like ORT's
+  `MatMulNBits` but hand-written + faster) — but it's **minified-only** (no forkable source).
+- So "**big AND fast** custom kernels" = port in-shader-q4 into the forkable framework
+  (LFM2 bundle + ORT `MatMulNBits` as references). The headline roadmap item if speed lands.
+
+**Decider experiment (run first):** custom-kernel **Qwen3-1.7B / 4B tok/s vs the ORT
+baselines (15.2 / 9.2)** on this machine. 1.7B fits F16 cleanly; 4B may exceed the slice
+(expected caveat row). One number decides whether T6 is worth pursuing.
+
+| Mode | Model | dtype | tok/s | mem peak | in-browser today? |
+|---|---|---|---|---|---|
+| Custom-WGSL (T6) | Qwen3-1.7B | F16 (custom) | — *(vs ORT 15.2)* | ~3.4 GB F16 | spike — `custom-kernels/`, not yet wired |
+| Custom-WGSL (T6) | Qwen3-4B | F16 (custom) | — *(vs ORT 9.2)* | ~8 GB F16 ⚠ | spike — may exceed slice |
+| Custom-WGSL (T6) | Gemma 4 E2B | GGUF→F16 | ~250 (LocalMind) | ~4 GB F16 | ✅ the fork's native model |
