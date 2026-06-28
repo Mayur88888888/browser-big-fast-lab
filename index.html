@@ -151,11 +151,15 @@ const MODELS = [
 const LANE_RESOURCE = { ours: 'gguf', tjs: 'onnx', ort: 'onnx', lm: 'lm' };
 function laneSupports(key, meta) { return meta && !!meta[LANE_RESOURCE[key]]; }
 
-// The webml-community kernels lane links out to Xenova's canonical HF Spaces rather
-// than re-hosting them (the Spaces carry no license — we won't re-host unlicensed code).
+// The webml-community kernels lane runs Xenova's hand-written WebGPU engines inline
+// (vendored from the HF Spaces, adapted in our LocalMind — all credit to the authors).
 const WEBML_SPACE = {
   'gemma-4-e2b': 'https://huggingface.co/spaces/webml-community/gemma-4-webgpu-kernels',
   'lfm2_5': 'https://huggingface.co/spaces/webml-community/lfm2-webgpu-kernels',
+};
+const WEBML_ENGINE = {
+  'gemma-4-e2b': { file: './engine/webml-gemma-4-e2b.js', cls: 'Gemma4Mobile' },
+  'lfm2_5':      { file: './engine/webml-lfm2.js',        cls: 'Lfm2Mobile' },
 };
 
 const LANES = [
@@ -171,8 +175,8 @@ const LANES = [
     desc: "Hugging Face's transformers.js (bundles onnxruntime-web). The off-the-shelf baseline." },
   { key: 'ort',  name: 'raw onnxruntime-web', tag: 'ONNX · WebGPU EP', status: 'idle', color: 'var(--c-ort)',
     desc: 'Raw ORT-web session (no transformers.js wrapper) — same ONNX weights, hand-written KV-cache decode.' },
-  { key: 'lm',   name: 'webml-community kernels', tag: 'WebGPU · hand-WGSL', status: 'idle', link: true, color: 'var(--c-lm)',
-    desc: "Xenova's hand-written WebGPU kernels — adapted in our <a href='https://github.com/NakliTechie/LocalMind' target='_blank' rel='noopener'>LocalMind</a>. Run them on the original Spaces &#8594; *" },
+  { key: 'lm',   name: 'webml-community kernels', tag: 'WebGPU · hand-WGSL', status: 'idle', color: 'var(--c-lm)',
+    desc: "Xenova's hand-written WebGPU kernels (Gemma-4 QAT / LFM2.5), run inline via our <a href='https://github.com/NakliTechie/LocalMind' target='_blank' rel='noopener'>LocalMind</a> adaptation. Credit: <a href='https://huggingface.co/spaces/webml-community/gemma-4-webgpu-kernels' target='_blank' rel='noopener'>gemma-4</a> · <a href='https://huggingface.co/spaces/webml-community/lfm2-webgpu-kernels' target='_blank' rel='noopener'>lfm2</a> Spaces.*" },
 ];
 
 const state = {};  // key -> { engine, loaded, model }
@@ -220,7 +224,6 @@ for (const L of LANES) {
 function refreshAvailability() {
   const meta = MODELS.find(m => m.id === modelSel.value);
   for (const L of LANES) {
-    if (L.link) continue;  // link-out lanes (webml Spaces) are always available
     const wired = L.status !== 'soon';
     const supported = laneSupports(L.key, meta);
     const loaded = !!(state[L.key] && state[L.key].loaded);
@@ -278,12 +281,6 @@ function argmaxRow(data, off, V, isF16) {
 
 async function loadLane(key) {
   const meta = MODELS.find(m => m.id === modelSel.value);
-  // The webml-community lane links out to Xenova's canonical Space (not re-hosted).
-  if (key === 'lm') {
-    const url = WEBML_SPACE[meta?.lm];
-    if (url) window.open(url, '_blank', 'noopener');
-    return;
-  }
   setLaneClass(key, 'loading');
   laneEl(key).querySelector('[data-load]').disabled = true;
   setOut(key, ''); setStats(key, '');
@@ -341,6 +338,21 @@ async function loadLane(key) {
         eos: new Set([].concat(cfg.eos_token_id ?? 151645).map(Number)),
       };
       state[key] = { session, tok, ort, arch, loaded: true, model: meta.id, type: 'ort' };
+    } else if (key === 'lm') {
+      const spec = WEBML_ENGINE[meta.lm];
+      if (!spec) throw new Error('no webml engine for this model');
+      setStatus(key, `loading ${meta.label} (webml kernels)…`);
+      const mod = await import(spec.file);
+      const Mobile = mod[spec.cls];
+      // Guard the GPU-init tail with a timeout so a stuck device never hangs the
+      // auto-cycle (the webml engine creates its own WebGPU device).
+      const engine = await Promise.race([
+        Mobile.load(null, {
+          onProgress: (ev) => { if (ev && ev.status === 'weights' && ev.total) setStatus(key, `↓ weights ${(100 * ev.loaded / ev.total).toFixed(0)}%`); },
+        }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('engine GPU init timed out (try a fresh tab)')), 180000)),
+      ]);
+      state[key] = { engine, loaded: true, model: meta.id, type: 'lm' };
     } else {
       throw new Error('lane not wired yet');
     }
@@ -443,6 +455,19 @@ async function runLane(key) {
       const ms = performance.now() - t0, n = gen.length;
       const tps = n > 1 ? ((n - 1) / ((ms - firstMs) / 1000)) : (n / (ms / 1000));
       result = { tps, ttft: firstMs / 1000, n };
+    } else if (key === 'lm') {
+      const engine = s.engine;
+      const msgs = [{ role: 'user', content: prompt }];
+      let n = 0, firstMs = 0, prev = ''; const t0 = performance.now();
+      setOut(key, '');
+      const stream = engine.generate(msgs, { maxNewTokens: maxTok });
+      for await (const out of stream) {
+        const full = (out && typeof out.text === 'string') ? out.text : '';
+        if (full.length > prev.length) { if (!firstMs) firstMs = performance.now() - t0; n++; setOut(key, full); prev = full; }
+      }
+      const ms = performance.now() - t0;
+      const tps = n > 1 ? ((n - 1) / ((ms - firstMs) / 1000)) : (n / (ms / 1000));
+      result = { tps, ttft: firstMs / 1000, n };
     }
   } catch (e) {
     laneEl(key)?.classList.remove('running');
@@ -501,7 +526,7 @@ let autoBusy = false;
 async function runAuto() {
   if (autoBusy) return;
   const meta = MODELS.find(m => m.id === modelSel.value);
-  const order = ['ours', 'tjs', 'ort'].filter(k => laneSupports(k, meta));
+  const order = ['ours', 'tjs', 'ort', 'lm'].filter(k => laneSupports(k, meta));
   if (!order.length) return;
   autoBusy = true;
   const btn = document.getElementById('autoRun');
