@@ -30,10 +30,14 @@
   button:hover:not(:disabled) { background: #2f3547; border-color: #41485c; }
   button:disabled { opacity: .4; cursor: not-allowed; }
   button.primary { background: var(--accent); color: #06101f; border-color: var(--accent); font-weight: 600; }
-  button.auto { background: var(--c-lm); color: #06190d; border-color: var(--c-lm); font-weight: 600; }
+  button.auto { background: var(--c-lm); color: #06190d; border-color: var(--c-lm); font-weight: 700; }
+  button.runbtn:not(:disabled) { background: var(--lc, var(--accent)); color: #06101f; border-color: var(--lc, var(--accent)); font-weight: 600; }
+  .hint { color: var(--muted); font-size: 12.5px; margin: -6px 2px 16px; line-height: 1.6; }
+  .hint b { color: var(--ink); font-weight: 600; }
   a.spacelink { display: inline-block; text-decoration: none; color: var(--c-lm); background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; font-size: 13px; }
   a.spacelink:hover { background: #2f3547; border-color: var(--c-lm); }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 16px; align-items: start; }
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; align-items: start; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
   .lane { background: var(--panel); border: 1px solid var(--line); border-top: 3px solid var(--lc, var(--muted)); border-radius: 10px; display: flex; flex-direction: column; overflow: hidden; }
   .lane.running { box-shadow: 0 0 0 1px var(--lc), 0 0 18px -6px var(--lc); }
   .lane .head { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
@@ -51,6 +55,7 @@
   .lane .stats b { color: var(--lc, var(--accent)); font-weight: 600; }
   .lane .status { font-size: 12px; color: var(--muted); font-family: var(--mono); min-height: 16px; }
   .lane .out { background: #0a0b0e; border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; word-break: break-word; height: 150px; overflow: auto; }
+  .lane .out:empty::before { content: 'output will appear here'; color: #4b5060; font-style: italic; }
   .foot { margin-top: 26px; color: var(--muted); font-size: 12px; line-height: 1.7; }
   .foot code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
   .foot .fn { font-size: 11.5px; opacity: .85; }
@@ -83,12 +88,14 @@
     </div>
     <div class="field">
       <label for="maxtok">Max tokens</label>
-      <input id="maxtok" type="number" value="48" min="1" max="1024" style="width: 90px;" />
+      <input id="maxtok" type="number" value="128" min="1" max="1024" style="width: 90px;" />
     </div>
-    <button id="autoRun" class="auto" title="Load → run → unload each runnable lane in turn, then tabulate">Auto-cycle all ▶▶</button>
-    <button id="runAll" class="primary">Run loaded ▶</button>
-    <button id="unloadAll">Unload all</button>
+    <button id="autoRun" class="auto" title="Load → run → unload each engine in turn, then tabulate a comparison">⚡ Auto-cycle &amp; compare</button>
+    <button id="runAll" title="Run every lane you've already loaded">Run loaded</button>
+    <button id="unloadAll" title="Free GPU memory from all loaded lanes">Unload all</button>
   </div>
+
+  <p class="hint">Pick a model, then hit <b>⚡ Auto-cycle &amp; compare</b> to load → run → unload each engine and get a stats table — or test one engine at a time with its own <b>Load</b> → <b>Run</b>. Greyed lanes can't run the selected model.</p>
 
   <div class="grid" id="lanes"></div>
 
@@ -96,7 +103,7 @@
 
   <div class="foot">
     <strong>How it works.</strong> Each lane loads the model independently into the browser's WebGPU device and runs a greedy decode of your prompt, reporting tokens/sec.
-    Models are fetched from Hugging Face on first use (cached by the browser afterward).
+    Weights are fetched from Hugging Face on first use — ~0.2–5 GB depending on the model, so the first <b>Load</b> can take ~1 min (cached by the browser afterward; subsequent loads are seconds). The webml lane runs best in a fresh tab.
     <br><br>
     <strong>Credits.</strong>
     The <em>custom WGSL engine</em> lane is our fork of
@@ -176,7 +183,7 @@ const LANES = [
   { key: 'ort',  name: 'raw onnxruntime-web', tag: 'ONNX · WebGPU EP', status: 'idle', color: 'var(--c-ort)',
     desc: 'Raw ORT-web session (no transformers.js wrapper) — same ONNX weights, hand-written KV-cache decode.' },
   { key: 'lm',   name: 'webml-community kernels', tag: 'WebGPU · hand-WGSL', status: 'idle', color: 'var(--c-lm)',
-    desc: "Xenova's hand-written WebGPU kernels (Gemma-4 QAT / LFM2.5), run inline via our <a href='https://github.com/NakliTechie/LocalMind' target='_blank' rel='noopener'>LocalMind</a> adaptation. Credit: <a href='https://huggingface.co/spaces/webml-community/gemma-4-webgpu-kernels' target='_blank' rel='noopener'>gemma-4</a> · <a href='https://huggingface.co/spaces/webml-community/lfm2-webgpu-kernels' target='_blank' rel='noopener'>lfm2</a> Spaces.*" },
+    desc: "Xenova's WebGPU kernels, via our <a href='https://github.com/NakliTechie/LocalMind' target='_blank' rel='noopener'>LocalMind</a> adaptation — runs <b>Gemma-4 E2B</b> &amp; <b>LFM2.5-350M</b> only.*" },
 ];
 
 const state = {};  // key -> { engine, loaded, model }
@@ -213,12 +220,11 @@ for (const L of LANES) {
   card.className = 'lane';
   card.id = 'lane-' + L.key;
   if (L.color) card.style.setProperty('--lc', L.color);
-  const controls = L.link
-    ? `<a class="spacelink" href="${WEBML_SPACE['gemma-4-e2b']}" target="_blank" rel="noopener">gemma-4 ↗</a>
-       <a class="spacelink" href="${WEBML_SPACE['lfm2_5']}" target="_blank" rel="noopener">lfm2 ↗</a>`
-    : `<button data-load="${L.key}" disabled>Load</button>
-       <button data-unload="${L.key}" disabled>Unload</button>
-       ${L.extra || ''}`;
+  const controls =
+    `<button data-load="${L.key}" disabled>Load</button>
+     <button data-run="${L.key}" class="runbtn" disabled>Run ▶</button>
+     <button data-unload="${L.key}" disabled>Unload</button>
+     ${L.extra || ''}`;
   card.innerHTML = `
     <div class="head"><span class="dot"></span><h3>${L.name}</h3><span class="tag">${L.tag}</span></div>
     <div class="body">
@@ -243,8 +249,10 @@ function refreshAvailability() {
     const supported = laneSupports(L.key, meta);
     const loaded = !!(state[L.key] && state[L.key].loaded);
     const loadBtn = laneEl(L.key)?.querySelector('[data-load]');
+    const runBtn = laneEl(L.key)?.querySelector('[data-run]');
     const naEl = laneEl(L.key)?.querySelector('[data-na]');
     if (loadBtn) loadBtn.disabled = !wired || !supported || loaded;
+    if (runBtn) runBtn.disabled = !loaded;
     if (naEl) naEl.style.display = (wired && !supported) ? '' : 'none';
   }
 }
@@ -513,8 +521,10 @@ async function runLane(key) {
 
 lanesEl.addEventListener('click', (e) => {
   const load = e.target.getAttribute?.('data-load');
+  const run = e.target.getAttribute?.('data-run');
   const unload = e.target.getAttribute?.('data-unload');
   if (load) loadLane(load);
+  if (run && state[run]?.loaded) runLane(run);
   if (unload) unloadLane(unload);
 });
 document.getElementById('runAll').addEventListener('click', () => {
