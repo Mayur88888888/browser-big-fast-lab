@@ -150,6 +150,16 @@ generation is fully coherent and factually correct. The speed cost (10 vs 35 tok
 scalar GEMV + per-element dequant with no MR4 fast path — **the lever here is memory, not
 speed**, and that's what makes 8B reachable.
 
+**Measurement caveat (tps):** these tps were taken on a busy machine (WindowServer + other
+Chrome tabs + background jobs all sharing the one Metal GPU; single-token decode is
+latency-bound, so contention inflates the gaps between the per-layer dispatches). The
+**absolute** numbers are a busy-machine floor — idle, they'd be materially higher. What is
+contention-*invariant* is the **F16-vs-Q4_K ratio** (~3.5×, both measured same-session,
+same machine): that gap is algorithmic — F16 runs `matmulQuantMR4` (4 rows/workgroup +
+vectorized f16 loads) while Q4_K is a plain scalar GEMV (1 row/wg, `mr4` force-disabled for
+in-shader quant). The speed half is recoverable with an MR4-style / vectorized Q4_K kernel
+(unpack all 8 nibbles per u32, vec4 input); the memory lever is already banked.
+
 **The 8B-in-browser demo — the headline F16 couldn't reach:**
 
 | Qwen3-8B Q4_K_M (in-shader q4k) | value |
