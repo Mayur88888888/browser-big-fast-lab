@@ -84,7 +84,7 @@
     </div>
     <div class="field" style="flex:1; min-width: 280px;">
       <label for="prompt">Prompt</label>
-      <textarea id="prompt">The capital of France is</textarea>
+      <textarea id="prompt">Give me an essay on the history of Rome.</textarea>
     </div>
     <div class="field">
       <label for="maxtok">Max tokens</label>
@@ -130,6 +130,9 @@
 // Other lanes are scaffolded with a clear status; they come online next.
 // Pure static (ESM via CDN) so it deploys with no build step.
 // ───────────────────────────────────────────────────────────────────────────
+
+// Cache model downloads (HF weights) in CacheStorage so re-loads don't re-fetch.
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
 
 // Per-lane availability: `gguf` → our WGSL engine (qwen3 / gemma4 arches only);
 // `onnx` → transformers.js + raw ORT-web; `lm` → LocalMind's hand-rolled engine.
