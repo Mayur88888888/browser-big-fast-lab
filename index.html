@@ -83,7 +83,7 @@
     </div>
     <div class="field">
       <label for="maxtok">Max tokens</label>
-      <input id="maxtok" type="number" value="48" min="1" max="512" style="width: 90px;" />
+      <input id="maxtok" type="number" value="48" min="1" max="1024" style="width: 90px;" />
     </div>
     <button id="autoRun" class="auto" title="Load → run → unload each runnable lane in turn, then tabulate">Auto-cycle all ▶▶</button>
     <button id="runAll" class="primary">Run loaded ▶</button>
@@ -382,7 +382,7 @@ async function runLane(key) {
   const s = state[key];
   if (!s?.loaded) return null;
   const prompt = document.getElementById('prompt').value;
-  const maxTok = Math.max(1, Math.min(512, +document.getElementById('maxtok').value || 48));
+  const maxTok = Math.max(1, Math.min(1024, +document.getElementById('maxtok').value || 48));
   setOut(key, ''); setStats(key, ''); setStatus(key, 'generating…');
   laneEl(key)?.classList.add('running');
   let result = null;
