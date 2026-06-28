@@ -105,7 +105,7 @@ on the agenda.**
 
 **Correctness: `crossLabDiff` GREEN** (2026-06-27). Qwen3-1.7B q4_k_m engine vs HF `Qwen/Qwen3-1.7B` bf16 reference, same tokens: embed 0.99990, per-layer all ≥0.985 (00 .99912 / 06 .99230 / 13 .98555 / 20 .99200 / 26 .99702), final 0.99635, **logits 0.99636, argmax=Paris on both**. Smooth monotonic F16 drift, no kernel-bug cliff → numerically equivalent within q4+F16 tolerance. Reference: `custom-kernels/reference/pytorch/qwen3_smoke.py` + committed `public/ref/qwen3_smoke.npz`. The decisive port bug found en route — Gemma hardcodes attention `scaling=1.0`; Qwen3 needs `1/√head_dim`, else softmax over-sharpens → degenerate repetition. **Caveat (tokenizer layer, not forward pass):** the engine's `tokenizer.encode` drops GPT-2 `Ġ` space markers and the chat template is still Gemma-specific — generation survives but real-prompt quality is degraded; tracked for the generalised-engine work.
 
-**The memory tradeoff:** F16-everywhere = fast but heavy. 4B = ~8 GB F16 (fits the 24 GB laptop). 8B F16 ≈ 16 GB → impractical → the **"big AND fits" lever is in-shader q4/q8** (keep weights quantized in GPU like ORT `MatMulNBits` / the LFM2 minified engine). **RESOLVED 2026-06-28: in-shader Q4_K runs Qwen3-8B in a browser tab** (4.34 GB layer weights vs 13.9 GB F16) — see the Q4_K + 8B section below. The trade is speed (scalar GEMV, ~5 tok/s at 8B) for reach; the 4–8 GB-class sweet spot is now in hand.
+**The memory tradeoff:** F16-everywhere = fast but heavy. 4B = ~8 GB F16 (fits the 24 GB laptop). 8B F16 ≈ 16 GB → impractical → the **"big AND fits" lever is in-shader q4/q8** (keep weights quantized in GPU like ORT `MatMulNBits` / the LFM2 minified engine). **RESOLVED 2026-06-28: in-shader Q4_K runs Qwen3-8B in a browser tab** (4.34 GB layer weights vs 13.9 GB F16) — see the Q4_K + 8B section below. Originally the trade was speed (scalar GEMV) for reach — **now closed**: the MR4 Q4_K kernel (2026-06-28) makes 4-bit the *fastest* path (1.58× F16 same-session on 1.7B), so the 4–8 GB-class sweet spot is in hand at no speed cost. See the Q4_K speed table below.
 
 ### In-shader Q8_0 — the memory lever (MEASURED 2026-06-27)
 
@@ -141,24 +141,34 @@ stay F16. Commit `9cd1f2f` (custom-kernels).
 | crossLabDiff logits cosine | 0.99636 | 0.99666 | **0.906** (argmax=ĠParis ✓) |
 | crossLabDiff per-layer cosine | ≥0.985 | ≥0.985 | **0.92–0.997** (smooth, no cliff) |
 | coherent greedy decode | ✓ | ✓ | ✓ ("…Paris. The capital of Italy is Rome…") |
-| tps (short, maxTok=64) | 35.6 | 34.7 | **10.2** (scalar GEMV, no MR4) |
+| tps — scalar kernel (initial) | 35.6 | 34.7 | 10.2 (1-row GEMV) |
+| tps — **MR4 kernel (2026-06-28)** | — | — | **40.6** (1.58× F16 same-session) |
 | layer-weight GPU mem | 2.82 GB | 1.50 GB | **~0.88 GB** (3.2×) |
 
 The lower logit cosine (0.906 vs F16's 0.996) is **expected 4-bit degradation**, not a bug:
 the curve is smooth (no kernel-bug cliff), argmax is preserved (=HF reference), and greedy
-generation is fully coherent and factually correct. The speed cost (10 vs 35 tok/s) is the
-scalar GEMV + per-element dequant with no MR4 fast path — **the lever here is memory, not
-speed**, and that's what makes 8B reachable.
+generation is fully coherent and factually correct.
 
-**Measurement caveat (tps):** these tps were taken on a busy machine (WindowServer + other
-Chrome tabs + background jobs all sharing the one Metal GPU; single-token decode is
-latency-bound, so contention inflates the gaps between the per-layer dispatches). The
-**absolute** numbers are a busy-machine floor — idle, they'd be materially higher. What is
-contention-*invariant* is the **F16-vs-Q4_K ratio** (~3.5×, both measured same-session,
-same machine): that gap is algorithmic — F16 runs `matmulQuantMR4` (4 rows/workgroup +
-vectorized f16 loads) while Q4_K is a plain scalar GEMV (1 row/wg, `mr4` force-disabled for
-in-shader quant). The speed half is recoverable with an MR4-style / vectorized Q4_K kernel
-(unpack all 8 nibbles per u32, vec4 input); the memory lever is already banked.
+**Speed — the MR4 kernel closed (then reversed) the gap.** The initial Q4_K was a scalar
+1-row GEMV (no fast path) → slow. `matmul_q4k_mr.wgsl` produces 4 output rows/workgroup
+(input read once, dequant 4 rows in-loop, shared tree-reduce), applied to **all** q4k
+matmuls — where F16 only MR's the FFN. Bit-identical output (Node check + crossLabDiff
+reproduced the scalar numbers exactly). Same-session, same-contention Qwen3-1.7B:
+
+| | short (64) | long (200) |
+|---|---|---|
+| F16 | 25.7 | 24.4 |
+| **Q4_K-MR** | **40.6** | **40.4** |
+
+**4-bit is now the *fastest* path AND 3.2× smaller** — MR covers all matmuls (vs F16's
+FFN-only) and 4-bit moves ¼ the weight bytes.
+
+**Measurement caveat (contention):** absolute tps depends on machine load — single-token
+decode is latency-bound and this is a shared Metal GPU (F16 was 35.6 a less-busy session,
+25.7 here). So cite the **same-session ratio**, not the absolute: Q4_K-MR is **1.58× F16**
+measured back-to-back. (The earlier "scalar q4k 10.2 vs F16 35.6" was also same-session;
+the ~4× scalar→MR absolute jump spans different-contention periods, so the F16-relative
+numbers are the trustworthy ones.)
 
 **The 8B-in-browser demo — the headline F16 couldn't reach:**
 
@@ -184,3 +194,4 @@ chunks → no >2 GB F32 intermediate) load and run it. This is the 4–8 GB-clas
 - **2026-06-27** · Qwen3-1.7B · **`weightQuant:'q8'`** (in-shader Q8_0) · loaded clean, **coherent** ("…is Paris. Now, let's create a simple program…") · crossLabDiff logits **0.99666**, argmax=Paris (= F16 quality) · tps 34.7/42.0 (= F16) · weight mem 3.44→2.12 GB. *Purpose: prove the in-shader memory lever. Result: correct + same speed + ~1.9× smaller layer weights.* The decisive design choice — store int8+f16-scale per 32-block, dequant in the GEMV loop; mr4 fast-path disabled for q8 (scalar GEMV).
 - **2026-06-28** · Qwen3-1.7B · **`weightQuant:'q4k'`** (in-shader 4-bit) · crossLabDiff smooth (embed 0.9999, per-layer 0.92–0.997, logits **0.906, argmax=ĠParis**) · raw-token greedy decode **coherent** ("ĠParis. The capital of Italy is Rome. …Japan is Tokyo. …Korea is Seoul. …China is Beijing.") · tps **10.2 short** · layer-weight mem ~0.88 GB (3.2× vs F16) · load 71 s. *Purpose: the deeper 4-bit memory lever for the 4–8B class. Result: correct (4-bit-expected quality, no cliff) + coherent + ~3.2× smaller.* **Bug fixed mid-run:** `meta` is a WGSL reserved keyword → the shader silently failed to compile → layer-0 cosine 0.004 garbage; renaming the binding to `qmeta` produced the green sweep. Decode-quality method: argmax token (=ĠParis) is the decisive signal when 4-bit logit cosine drops; crossLabDiff *smoothness* (vs a cliff) separates quant error from a kernel bug.
 - **2026-06-28** · **Qwen3-8B Q4_K_M** · **`weightQuant:'q4k'`** · **loaded + ran in a browser tab** (the payoff F16 couldn't reach) · 36 layers, untied lm_head · first token after "The capital of France is" = **ĠParis**, **coherent** ("…Rome. …Germany is Berlin. …Spain is Madrid. …Belgium is Brussels.") · tps **5.2 short / 3.2 cold** · layer-weight mem **4.34 GB** (vs 13.9 GB F16) · total ~6.8 GB on the 24 GB laptop · load 432 s (4.7 GB, download-bound). *Purpose: the headline — big-AND-fits. Result: 8B runs in-browser at 4-bit.* **Enabler:** `dequantToF16Chunked` — the 8B token_embd (622M elems) needs a 2.49 GB F32 intermediate in one shot (blows V8's alloc ceiling); decoding in 16M-elem chunks into the single 1.24 GB F16 output dodges it. Embeddings/lm_head stay F16.
+- **2026-06-28** · Qwen3-1.7B · **`matmul_q4k_mr.wgsl`** (the speed half) · multi-row Q4_K matmul (R=4 rows/wg, mirrors `matmulQuantMR4`) applied to **all** q4k matmuls via `dispatchMatmulRows` (ceil(M/4)). Correctness **bit-identical** to the scalar kernel — Node check 17920 elems maxDiff=0; in-browser crossLabDiff reproduced the scalar sweep exactly (logits 0.90593, L13 0.92092, argmax=ĠParis, coherent). Bench (same session/contention): **Q4_K-MR 40.6 short / 40.4 long vs F16 25.7 / 24.4 → 1.58×/1.65× F16**. *Purpose: recover the speed the scalar GEMV left on the table. Result: 4-bit is now the **fastest** path AND 3.2× smaller.* Why faster than F16: MR covers every q4k matmul (F16 MR's FFN only) and 4-bit moves ¼ the weight bytes. Method note: predicted 1.5–2.2× (overhead-bound classification correct); the larger realized gain = MR-everywhere + 4-bit bandwidth. Used the **same-session F16 anchor** (not the cross-session scalar 10.2) as the contention-clean comparison.
