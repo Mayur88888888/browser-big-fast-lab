@@ -153,8 +153,11 @@ const MODELS = [
     gguf: GGUF('unsloth/gemma-4-E4B-it-GGUF', 'gemma-4-E4B-it-Q4_K_M.gguf'), onnx: null, lm: null },
   { id: 'Gemma-3-270M', label: 'Gemma-3 270M', tjs_dtype: 'q4f16',
     gguf: null, onnx: 'onnx-community/gemma-3-270m-ONNX', lm: null },
-  { id: 'LFM2-350M', label: 'LFM2 350M', tjs_dtype: 'q4f16',
-    gguf: null, onnx: 'onnx-community/LFM2-350M-ONNX', lm: 'lfm2_5' },
+  // LFM2.5-230M (LiquidAI): hybrid 14-block (8 LIV-conv + 6 GQA). ONNX has no q4f16
+  // build, so dtype is q4 (model_q4.onnx) for the tjs/ort lanes; webml runs the
+  // LFM2.5-230M Q4_0 GGUF. Our WGSL engine has no LFM2 (conv-hybrid) arch → gguf null.
+  { id: 'LFM2.5-230M', label: 'LFM2.5 230M', tjs_dtype: 'q4',
+    gguf: null, onnx: 'LiquidAI/LFM2.5-230M-ONNX', lm: 'lfm2_5' },
 ];
 
 // Which model resource each lane needs (so we can grey out lanes a model can't run).
@@ -186,7 +189,7 @@ const LANES = [
   { key: 'ort',  name: 'raw onnxruntime-web', tag: 'ONNX · WebGPU EP', status: 'idle', color: 'var(--c-ort)',
     desc: 'Raw ORT-web session (no transformers.js wrapper) — same ONNX weights, hand-written KV-cache decode.' },
   { key: 'lm',   name: 'webml-community kernels', tag: 'WebGPU · hand-WGSL', status: 'idle', color: 'var(--c-lm)',
-    desc: "Xenova's WebGPU kernels, via our <a href='https://github.com/NakliTechie/LocalMind' target='_blank' rel='noopener'>LocalMind</a> adaptation — runs <b>Gemma-4 E2B</b> &amp; <b>LFM2.5-350M</b> only.*" },
+    desc: "Xenova's WebGPU kernels, via our <a href='https://github.com/NakliTechie/LocalMind' target='_blank' rel='noopener'>LocalMind</a> adaptation — runs <b>Gemma-4 E2B</b> &amp; <b>LFM2.5-230M</b> only.*" },
 ];
 
 const state = {};  // key -> { engine, loaded, model }
@@ -369,15 +372,20 @@ async function loadLane(key) {
       if (!spec) throw new Error('no webml engine for this model');
       setStatus(key, `loading ${meta.label} (webml kernels, worker)…`);
       // Run the engine in a dedicated worker (like LocalMind) — recovers the ~2×
-      // it loses on the main thread. Timeout guards a stuck GPU device.
+      // it loses on the main thread. The worker self-times-out and reports a lost
+      // device; we mirror that with a page-side backstop and terminate the worker
+      // on any failure, so a wedged GPU fails fast (and the lane can be reloaded)
+      // instead of hanging forever at "weights 100%".
       const worker = new Worker('./engine/webml-worker.js', { type: 'module' });
       await new Promise((resolve, reject) => {
-        const to = setTimeout(() => { worker.terminate(); reject(new Error('engine GPU init timed out (try a fresh tab)')); }, 180000);
+        const fail = (msg) => { try { worker.terminate(); } catch {} reject(new Error(msg)); };
+        const to = setTimeout(() => fail('engine GPU init timed out — device likely lost (reload the tab)'), 135000);
         worker.onmessage = (ev) => {
           const m = ev.data;
           if (m.type === 'progress') setStatus(key, `↓ weights ${m.pct.toFixed(0)}%`);
           else if (m.type === 'loaded') { clearTimeout(to); resolve(); }
-          else if (m.type === 'error') { clearTimeout(to); reject(new Error(m.error)); }
+          else if (m.type === 'device-lost') { clearTimeout(to); fail(`WebGPU device lost during init (${m.reason || ''}) — reload the tab`); }
+          else if (m.type === 'error') { clearTimeout(to); fail(m.error); }
         };
         worker.postMessage({ cmd: 'load', file: new URL(spec.file, location.href).href, cls: spec.cls });
       });
@@ -426,7 +434,25 @@ async function runLane(key) {
         callback_function: (text) => { if (!firstMs) firstMs = performance.now() - t0; n++; acc += text; flush(acc); },
       });
       setOut(key, '');
-      await s.engine(prompt, { max_new_tokens: maxTok, do_sample: false, return_full_text: false, streamer });
+      // Pre-render the chat template so we feed an instruct-formatted prompt (the
+      // webml lane templates too; raw prompts make small instruct models like
+      // LFM2.5 loop on greedy). Some templates (LFM2.5) use `{% generation %}`
+      // assistant-mask markers that transformers.js's bundled Jinja can't parse —
+      // those are training-only no-ops, so strip them and retry; else fall back raw.
+      const tkz = s.engine.tokenizer;
+      const msgs = [{ role: 'user', content: prompt }];
+      let inputText;
+      try {
+        inputText = tkz.apply_chat_template(msgs, { tokenize: false, add_generation_prompt: true });
+      } catch (te) {
+        const ct = typeof tkz.chat_template === 'string' ? tkz.chat_template : null;
+        if (ct && /generation/.test(String(te?.message || te))) {
+          const cleaned = ct.replace(/\{%-?\s*generation\s*-?%\}/g, '').replace(/\{%-?\s*endgeneration\s*-?%\}/g, '');
+          try { inputText = tkz.apply_chat_template(msgs, { tokenize: false, add_generation_prompt: true, chat_template: cleaned }); }
+          catch { inputText = prompt; }
+        } else { inputText = prompt; }
+      }
+      await s.engine(inputText, { max_new_tokens: maxTok, do_sample: false, return_full_text: false, streamer });
       flush(acc, true);
       const ms = performance.now() - t0;
       const tps = n > 1 ? ((n - 1) / ((ms - firstMs) / 1000)) : (n / (ms / 1000));
@@ -495,11 +521,20 @@ async function runLane(key) {
       let acc = '';
       setOut(key, '');
       const done = await new Promise((resolve, reject) => {
+        // Watchdog: the worker self-times-out per step, but a fully wedged worker
+        // (its own event loop stuck on a lost device) can't even send that error —
+        // so back it up here. Re-arm on every token; trip if generation goes silent.
+        // On any failure terminate the worker and drop the lane so it can reload.
+        let wd;
+        const die = (why) => { clearTimeout(wd); try { worker.terminate(); } catch {} if (state[key]?.worker === worker) state[key] = null; reject(new Error(why)); };
+        const arm = (ms, why) => { clearTimeout(wd); wd = setTimeout(() => die(why), ms); };
+        arm(50000, 'no output — GPU likely lost (reload the tab)');
         worker.onmessage = (ev) => {
           const m = ev.data;
-          if (m.type === 'token') { acc += m.delta; flush(acc); }
-          else if (m.type === 'done') resolve(m);
-          else if (m.type === 'error') reject(new Error(m.error));
+          if (m.type === 'token') { acc += m.delta; flush(acc); arm(20000, 'generation stalled — GPU likely lost (reload the tab)'); }
+          else if (m.type === 'done') { clearTimeout(wd); resolve(m); }
+          else if (m.type === 'device-lost') { die(`WebGPU device lost (${m.reason || ''}) — reload the tab`); }
+          else if (m.type === 'error') { clearTimeout(wd); reject(new Error(m.error)); }
         };
         worker.postMessage({ cmd: 'run', prompt, maxTok });
       });
@@ -510,6 +545,7 @@ async function runLane(key) {
     laneEl(key)?.classList.remove('running');
     setLaneClass(key, 'error');
     setStatus(key, 'error: ' + (e?.message || e));
+    refreshAvailability();   // a dropped lane (e.g. lm device-loss) re-enables its Load button
     return null;
   }
   laneEl(key)?.classList.remove('running');
