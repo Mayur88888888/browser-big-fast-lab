@@ -293,6 +293,27 @@ The complete Unlimited-OCR pipeline runs in one browser tab, no server (`ocr-dem
 
 Not done (parked): fp16/quant pass on the 1.6 GB fp32 vision graph (→ ~800 MB; watch the LayerNorm-fp16 converter gotcha), crop-mode multi-tile layout, R-SWA ring KV (P2), HF publish (P3, stop-lined).
 
+### P2 RESULT (overnight autopilot 2026-07-15): **R-SWA ring-KV works — constant-memory long-doc decode, verified 3 ways** ✅
+
+The categorical differentiator is in: the engine decodes **past its own KV allocation** with memory flat in output length — a capability inexpressible in transformers.js/ORT-web (kernel-level cache management). Implementation is pure CPU-side uniform bookkeeping, **zero WGSL changes**: reference/prefill tokens stay cached forever, generated tokens recycle a 128-slot ring (`engine.beginRingDecode(P)`), attention runs unmasked over the valid cache, RoPE keeps true positions.
+
+| verification | result |
+|---|---|
+| **Tier-1** (structural) | ring vs plain ≤128 out: **bit-identical** (ids exact); W=8 probe → divergence exactly at wrap-bite (step 16), coherent throughout — ring provably engages+evicts |
+| **Tier-2** (vs bf16 ring reference) | teacher-forced on the HF ring stream, steps 128–207: **98.75% argmax agreement (79/80)**, single miss is a near-tie; free-run 95% token match (residual = q4 box-coordinate jitter), same 480-cap cut point |
+| **Tier-3** (the headline) | 3-page one-shot parse: **finalPos 1304 on a ctx-1024 KV allocation** — 280 positions past the window — **KV plateau 952 = P+128 exact**, 480 tokens @ **62.2 tok/s** (incl. per-token readback), all 3 `<PAGE>` blocks det-boxed + content-exact |
+| gate regression | Qwen3-1.7B **bit-exact vs baseline** (embed .9999 / L13 .92092 / logits .90593 / argmax ĠParis) after the shared-path refactor |
+
+**Findings worth keeping:**
+- **Naive HF position derivation BREAKS ring decode.** With the cache length frozen at P+W, deriving positions from cache length freezes RoPE at the wrap → generation collapses at step ~137 (observed: perfect page-1 transcription, then repetition garbage). The reference only works through `generate()`'s attention-mask cumsum; true-position semantics — the engine's design from the start — is the correct contract. Anyone reimplementing R-SWA will hit this.
+- The bf16 control transcribes multi-page documents perfectly through the wrap once positions are right — R-SWA does exactly what it was trained for.
+- Multi-page layout (from `infer_multi`): per page the same 273-token block as single-image (trailing token doubles as separator) — pure concatenation, prompt `<image>Multi page parsing.`
+- **Env gotchas that ate 6 "crash" cycles** (documented for the next overnight): writes into vite-watched dirs reload the page mid-run; `new Image().decode()` on detached images hangs FOREVER in backgrounded tabs (use `createImageBitmap`); 800+ unthrottled GPU submits kill the GPU process (prefill now syncs every 64 — `e2f1aa0`); pdf.js workers never handshake in the embedded preview pane (three strategies, zero errors — vendor same-origin or use real Chrome).
+
+**Parked from this run:** fp16 vision (2 attempts, both die on a pre-existing Cast-retyping converter bug in SAM rel-pos — next: torch-native `.half()` re-export) · real-PDF showpiece (env-blocked above; page committed WIP, chain is the proven P1/P2 path) · batched prefill (declined by design at 2am: M>1 through an M=1-shaped engine is >1 night — sketch in workplan; throttled per-token prefill costs ~30-45 s per 800-token doc).
+
+**SHIPPED:** merged → `deepseek-ocr` (`5974f0c`) → `main` (`0ca5e3a`), pushed to fork.
+
 ### T7 raw run log
 
 - **2026-07-14** · recon day (all findings above) · GGUF headers parsed byte-level via ranged fetch (`deepseek-ocr-spike/gguf_header.py`) · Q4_K_M + mmproj downloaded to `deepseek-ocr-spike/models/` (main checkout).
