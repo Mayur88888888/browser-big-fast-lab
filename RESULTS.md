@@ -255,6 +255,11 @@ Three premise-busting findings, each verified against primary sources (`config.j
 - **P2 — long-doc**: ring-buffer KV + batched prefill → multi-page one-shot parse, the constant-KV headline nobody else has in-browser. ~1 wk.
 - **P3 — publish**: HF `naklitechie/` (MIT upstream, notice retained) — engine-ready GGUF mirror + ONNX vision graph + demo page; candidate spin-off as its own public repo.
 
+### T7 raw run log
+
+- **2026-07-14** · recon day (all findings above) · GGUF headers parsed byte-level via ranged fetch (`deepseek-ocr-spike/gguf_header.py`) · Q4_K_M + mmproj downloaded to `deepseek-ocr-spike/models/` (main checkout).
+- **2026-07-14** · **P0 opened** on `custom-kernels` branch `deepseek-ocr` · **Q5_0 source dequant added + verified**: `blk.1.ffn_down_exps.weight` (real Q5_0 tensor, 262,144 elems) TS-vs-python-`gguf` reference — **0 mismatches >1e-7** (commit `92e52b6`, harness `scripts/check_q5_0.{mjs,py}`). Loader now covers every quant in the Q4_K_M file. Remaining P0: `deepseek-ocr` config, 3-D expert upload, MoE forward (router + top-6 + expert-indexed q4k GEMV + shared FFN), text-smoke + crossLabDiff.
+
 ### Caveats / watch items
 
 - The GGUFs require llama.cpp **PR #17400** (unmerged); if upstream lands different tensor naming/arch key, re-convert — our loader keys on the current names. The BF16 GGUF (5.88 GB) in the same repo is the requant fallback.
