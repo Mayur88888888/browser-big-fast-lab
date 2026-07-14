@@ -272,6 +272,27 @@ The full DeepSeek-V2-MoE decoder of Unlimited-OCR generates in a browser tab on 
 
 **Bugs found by the harness:** (1) BPE BOS silently dropped — `encodeBpe` keyed BOS on the literal `'<|endoftext|>'`; DeepSeek spells it `<｜begin▁of▁sentence｜>` → now honors `tokenizer.ggml.bos_token_id` (`bdb6d08`). (2) Q5_0 was an unsupported source quant → decoder added + verified vs python-gguf, 0 mismatches (`92e52b6`).
 
+### P1 RESULT (same night): **FULL end-to-end browser OCR — image in, det-boxed markdown out, <3 s/page** ✅
+
+The complete Unlimited-OCR pipeline runs in one browser tab, no server (`ocr-demo.html`, drive via `window.ocr.run()`):
+
+| stage | impl | time |
+|---|---|---|
+| document | canvas-drawn 1024² test page | — |
+| DeepEncoder (SAM→CLIP→projector) | **ONNX fp32 export** (`export_deepencoder_onnx.py`, opset 18, torch-vs-ORT parity **cosine 1.0000000**) on **ORT-web WebGPU EP** | **1.5 s** |
+| splice | 16 rows × (16 patches + `image_newline`) + `view_seperator` = 273 embeds | ~0 |
+| decoder prefill | `prefillEmbedsForCapture` (new engine inputs_embeds path) — [BOS] + 273 embeds + prompt | ~1 s |
+| greedy decode | custom-WGSL MoE decoder | **1.3 s** (111 tok, 86.9 tok/s incl. per-token readback) |
+
+**Output (exact, all 5 lines, natural EOS):** `<|det|>title [60, 72, 551, 134]<|/det|>Quarterly Report` + the four body lines verbatim — det boxes within ±2/1000 of the bf16 control's. The vision→decoder chain is **numerically faithful end-to-end**.
+
+**The decisive debugging move — prompt sensitivity, found via ground-truth controls** (`hf_image_control.py`, full bf16 HF stack on the same document, global-view-only):
+- `<image>\nFree OCR.` (DeepSeek-OCR-v1 phrasing) → **EOS at step 0 in bf16 too** — the browser chain was faithful all along; the prompt was wrong.
+- `<image>\n<|grounding|>Convert the document to markdown.` → talks, but recites instruction boilerplate.
+- **`<image>document parsing.`** (this model's README phrasing) → perfect det-boxed transcription in bf16 AND in-browser. *Method note: when a multimodal chain misbehaves, control with the full reference stack on identical input before touching the chain — here it converted a "debug the engine" night into a one-line prompt fix.*
+
+Not done (parked): fp16/quant pass on the 1.6 GB fp32 vision graph (→ ~800 MB; watch the LayerNorm-fp16 converter gotcha), crop-mode multi-tile layout, R-SWA ring KV (P2), HF publish (P3, stop-lined).
+
 ### T7 raw run log
 
 - **2026-07-14** · recon day (all findings above) · GGUF headers parsed byte-level via ranged fetch (`deepseek-ocr-spike/gguf_header.py`) · Q4_K_M + mmproj downloaded to `deepseek-ocr-spike/models/` (main checkout).
