@@ -14,6 +14,16 @@
         "/Users/chiragpatnaik/Code/browser-big-fast-lab"
       ],
       "port": 8131
+    },
+    {
+      "name": "ds-workbench",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run", "dev",
+        "--prefix", "/Users/chiragpatnaik/Code/browser-big-fast-lab/custom-kernels/.worktrees/autopilot-2026-07-14",
+        "--", "--port", "5199", "--strictPort"
+      ],
+      "port": 5199
     }
   ]
 }

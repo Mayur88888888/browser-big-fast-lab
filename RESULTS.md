@@ -255,10 +255,28 @@ Three premise-busting findings, each verified against primary sources (`config.j
 - **P2 — long-doc**: ring-buffer KV + batched prefill → multi-page one-shot parse, the constant-KV headline nobody else has in-browser. ~1 wk.
 - **P3 — publish**: HF `naklitechie/` (MIT upstream, notice retained) — engine-ready GGUF mirror + ONNX vision graph + demo page; candidate spin-off as its own public repo.
 
+### P0 RESULT (overnight autopilot 2026-07-14): **the MoE decoder RUNS on WebGPU — crossLabDiff green, 125 tok/s** ✅
+
+The full DeepSeek-V2-MoE decoder of Unlimited-OCR generates in a browser tab on the custom-WGSL engine (branch `autopilot/2026-07-14` → `deepseek-ocr`, worktree `custom-kernels/.worktrees/autopilot-2026-07-14`):
+
+| Unlimited-OCR decoder (Q4_K_M GGUF, in-shader q4k/q8) | value |
+|---|---|
+| loads + runs in a browser tab | **✓** (Apple Metal-3, apple-m-series profile) |
+| crossLabDiff vs HF bf16 reference | **GREEN**: embed .9952 · L0(dense) .9949 · **L1(first MoE) .9910** · smooth monotonic decay · final .8872 · logits **.8573, argmax=270 MATCH** — no cliff anywhere; same profile shape as the Qwen3 q4k precedent (logits .906) |
+| greedy decode | fluent English; loops on OOD free-text — **the bf16 HF reference loops identically** (OCR specialist, free text is out-of-distribution). Under raw prompts the model emits its native `<|det|>…<|/det|>` grounding format — the decoder is doing its actual job. |
+| decode speed | **125.4 tok/s median** (3 runs, spread 125.25–125.45), **TTFT 184 ms** — 3× the recon's 40–80 estimate; ~570 M active params/token is that cheap |
+| cold load | 31.5 s (local disk; 1.95 GB GGUF, fetch/requant overlapped) |
+| MoE cost | routed-expert block = **7 dispatches/layer** (batched expert kernels: `workgroup_id.z` = top-k slot) |
+
+**Implementation shape (commit `6c9ff7e` + `bdb6d08`):** shared-expert FFN rides the existing dense path via tensor aliasing (`ffn_*_shexp` → dense keys, I=1792); router (F16 GEMV, 64 logits) → `moe_topk.wgsl` (softmax + greedy top-6 **on-GPU** — no readback stall) → `matmul_q4k_expert.wgsl` / `matmul_q8_expert.wgsl` (expert id read from the selection buffer inside the kernel; z-dispatch batches all 6 experts; R=4 multi-row) → `moe_accum.wgsl` (`ffnDown += Σ wₖ·Eₖ`). Mixed storage: gate/up q4k, **all down projections q8** (their N = 896/1792/6848 aren't multiples of the 256-elem q4k super-block; bonus — `ffn_down_exps` source is Q5_0, so q8 is the higher-fidelity round-trip). Attention = the Qwen3 path minus QK-norm (plain `rope.wgsl`), full-causal (≡ R-SWA for ≤128 output tokens).
+
+**Bugs found by the harness:** (1) BPE BOS silently dropped — `encodeBpe` keyed BOS on the literal `'<|endoftext|>'`; DeepSeek spells it `<｜begin▁of▁sentence｜>` → now honors `tokenizer.ggml.bos_token_id` (`bdb6d08`). (2) Q5_0 was an unsupported source quant → decoder added + verified vs python-gguf, 0 mismatches (`92e52b6`).
+
 ### T7 raw run log
 
 - **2026-07-14** · recon day (all findings above) · GGUF headers parsed byte-level via ranged fetch (`deepseek-ocr-spike/gguf_header.py`) · Q4_K_M + mmproj downloaded to `deepseek-ocr-spike/models/` (main checkout).
-- **2026-07-14** · **P0 opened** on `custom-kernels` branch `deepseek-ocr` · **Q5_0 source dequant added + verified**: `blk.1.ffn_down_exps.weight` (real Q5_0 tensor, 262,144 elems) TS-vs-python-`gguf` reference — **0 mismatches >1e-7** (commit `92e52b6`, harness `scripts/check_q5_0.{mjs,py}`). Loader now covers every quant in the Q4_K_M file. Remaining P0: `deepseek-ocr` config, 3-D expert upload, MoE forward (router + top-6 + expert-indexed q4k GEMV + shared FFN), text-smoke + crossLabDiff.
+- **2026-07-14** · **P0 opened** on `custom-kernels` branch `deepseek-ocr` · **Q5_0 source dequant added + verified**: `blk.1.ffn_down_exps.weight` (real Q5_0 tensor, 262,144 elems) TS-vs-python-`gguf` reference — **0 mismatches >1e-7** (commit `92e52b6`, harness `scripts/check_q5_0.{mjs,py}`). Loader now covers every quant in the Q4_K_M file.
+- **2026-07-14 overnight** · P0 executed end-to-end on autopilot: config/types/loader/kernels/forward (`6c9ff7e`, typecheck ✓) · CPU reference `deepseek_ocr_smoke.py` (bf16, transformers 4.46.3 pinned env, language-only load 2234 tensors missing=0; top next-token ' the' +22.125) (`eb39f8c`) · tokens matched after the BOS fix (`bdb6d08`) · crossLabDiff sweep green (table above) · argmax 270 = reference · greedy parity with bf16 behavior · bench 125.4 tok/s / TTFT 184 ms / load 31.5 s. *Method note: the bf16-reference greedy run was the decisive control for "is the looping our bug or the model" — reference loops the same way on free text.*
 
 ### Caveats / watch items
 
