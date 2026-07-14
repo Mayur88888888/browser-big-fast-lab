@@ -197,3 +197,67 @@ chunks → no >2 GB F32 intermediate) load and run it. This is the 4–8 GB-clas
 - **2026-06-28** · Qwen3-1.7B · **`matmul_q4k_mr.wgsl`** (the speed half) · multi-row Q4_K matmul (R=4 rows/wg, mirrors `matmulQuantMR4`) applied to **all** q4k matmuls via `dispatchMatmulRows` (ceil(M/4)). Correctness **bit-identical** to the scalar kernel — Node check 17920 elems maxDiff=0; in-browser crossLabDiff reproduced the scalar sweep exactly (logits 0.90593, L13 0.92092, argmax=ĠParis, coherent). Bench (same session/contention): **Q4_K-MR 40.6 short / 40.4 long vs F16 25.7 / 24.4 → 1.58×/1.65× F16**. *Purpose: recover the speed the scalar GEMV left on the table. Result: 4-bit is now the **fastest** path AND 3.2× smaller.* Why faster than F16: MR covers every q4k matmul (F16 MR's FFN only) and 4-bit moves ¼ the weight bytes. Method note: predicted 1.5–2.2× (overhead-bound classification correct); the larger realized gain = MR-everywhere + 4-bit bandwidth. Used the **same-session F16 anchor** (not the cross-session scalar 10.2) as the contention-clean comparison.
 - **2026-06-28** · **MR for F16 + Q8** (`matmul_q8_mr.wgsl`; F16 attention routed through clamped `matmulQuantMR4`; unified dispatch behind `matmulRowsPerWg`). Every mode now does 4 rows/workgroup for **all** layer matmuls (F16 previously MR'd only the FFN; Q8 was fully scalar). Correctness **bit-exact-preserved** (Qwen3-1.7B crossLabDiff logits): **Q8 0.99667** (=prior 0.99666), **F16 0.99636** (=prior baseline), both coherent. *Purpose: widen the lead over transformers.js@4 across all modes. Result: every quant benefits; q4k remains the fastest+smallest.* **Bug caught by the Gemma regression check:** the tokenizer was mis-detecting arch — keyed byte-level-BPE on "merges present", but Gemma 4 GGUFs carry merges yet are SentencePiece (vocab uses ▁), so Gemma got byte-level-tokenized → garbage. Fixed to key on `tokenizer.ggml.model==='gpt2'`; Gemma E2B back to spm + coherent ("…Paris."). The matmul change itself never touched Gemma's numerics (Qwen3 f16 bit-exact proved the shared kernel).
 - **2026-06-28** · **Qwen3-8B Q4_K_M re-measured with the MR kernel** · coherent (" Paris. The capital of Italy is Rome. …Germany is Berlin. …Spain is…") · **6.76 tok/s short / 5.66 cold** vs the prior scalar **5.2** → ~1.3× (smaller than 1.7B's gain — 8B is more bandwidth-bound, and the machine was heavily contended this run). Load 403 s. Confirms MR helps the 8B class too; 8B remains the ours-only headline (no flat-q4f16 ONNX exists for transformers.js).
+
+## T7 — DeepSeek-OCR family in-browser: Unlimited-OCR spike (RECON 2026-07-14)
+
+**Target:** [baidu/Unlimited-OCR](https://huggingface.co/baidu/Unlimited-OCR) (released 2026-06-22, **MIT license**) — DeepSeek-OCR's DeepEncoder + DeepSeek-V2-MoE decoder with all decoder attention replaced by R-SWA (constant KV cache, one-shot 32K long-doc parsing). Eventual consumer: LocalMind's OCR tile. Deliverable of this section: export feasibility, op-gap, quant plan, **go/no-go**.
+
+### Verdict: **GO — the spike brief's hard 80% doesn't exist in this model**
+
+Three premise-busting findings, each verified against primary sources (`config.json`, `modeling_deepseekv2.py`, `modeling_unlimitedocr.py`, `deepencoder.py` — vendored into `deepseek-ocr-spike/upstream/` — plus the GGUF headers parsed byte-level from HF):
+
+1. **There is no MLA.** `config.json`: `"use_mla": false`, `q_lora_rank: null`, `kv_lora_rank: null`, `qk_rope_head_dim: 0`. When `use_mla=false` the modeling code routes to `SlidingWindowLlamaAttention(LlamaAttention)` — **bog-standard Llama MHA**: separate q/k/v/o `[1280×1280]` projections, no biases, RoPE (θ=10000 default, full head_dim), softmax/√d. 10 heads × 128 head_dim, `num_kv_heads = 10` (not even GQA). The engine already runs this attention (it's the Qwen3 path minus per-head QK-norm).
+2. **R-SWA is KV-cache management, not a kernel.** The reference implementation is a **ring buffer**: reference tokens (vision + prompt prefill) are kept forever; generated tokens overwrite slots in a `sliding_window_size = 128` ring (`kcache[:,:,slot:slot+1,:] = k` at `slot = prefill_len + ring_pos`). Decode attends over the full (constant-size) cache with **no mask at all** (q_len=1, every slot valid — softmax is permutation-invariant, and keys keep their original RoPE rotations so position gaps are benign). Corollary that collapses prototype scope: **for the first 128 generated tokens, R-SWA ≡ full causal attention** (the ring hasn't wrapped) — a phase-1 prototype needs zero attention changes; the ring is a phase-2 feature for the long-doc headline.
+3. **GGUFs already exist and GGUF is the engine's native input.** Community conversions (via llama.cpp PR #17400, not yet in upstream main) ship a full K-quant spread + fp16 mmproj: [sahilchachra/Unlimited-OCR-GGUF](https://huggingface.co/sahilchachra/Unlimited-OCR-GGUF) — **Q4_K_M 1.95 GB + mmproj-F16 812 MB = 2.76 GB in-tab total** (IQ4_XS 1.64 GB as the tighter option, needs an I-quant decoder). Both files downloaded to `deepseek-ocr-spike/models/` and header-verified. No ONNX export exists anywhere (checked onnx-community + HF search) — the ONNX path means building the export ourselves; the GGUF path means **no export step at all**.
+
+### Architecture ground truth (from GGUF headers + config.json — trust these, not the blog posts)
+
+| Component | Fact |
+|---|---|
+| Decoder | `deepseek2-ocr` GGUF arch · **12 layers** · hidden 1280 · vocab 129,280 · untied `output.weight` (Q6_K) · GGUF size label `64x550M` |
+| Attention | MHA 10q/10kv × head_dim 128 · RoPE θ=10000 · RMSNorm(ε=1e-6) · **no QK-norm, no biases** · scaling 1/√128 |
+| MoE (layers 1–11) | router `ffn_gate_inp [1280,64]` F32 · softmax scoring, **greedy top-6 of 64**, norm_topk_prob · experts packed 3-D: `ffn_{gate,up}_exps [1280,896,64]`, `ffn_down_exps [896,1280,64]` · **2 shared experts pre-fused** into one FFN `[1280,1792]` (added residually, ungated) |
+| Layer 0 | plain dense FFN, intermediate 6848 (`first_k_dense_replace: 1`) |
+| FFN activation | SiLU (SwiGLU) — same as Qwen3 path |
+| Vision (mmproj, 476 tensors, F16/F32) | **SAM ViT-B**: patch-embed conv 16×16 s16 (1024px → 64×64), 12 blocks, 768-dim, fused QKV+bias, **window-14 attention** (global at layers 2/5/8/11), **decomposed rel-pos** (`pos_h/pos_w [64,27]` per block), LayerNorm+bias, GELU; neck + 2 stride-2 convs (256→512→1024 ch) → **16×16×1024** = 16× compression. **CLIP-L**: 24 blocks, 1024-dim, 16 heads — consumes **SAM's output as its patch_embeds** (not raw pixels at full res), 257 tokens incl. CLS, interpolated pos-embeds. Fusion: `cat(CLIP[:,1:], SAM.flatten)` → 2048 → **one linear** `mm.model.fc [2048→1280]` → **256 vision tokens per 1024² tile** + `image_newline`/`view_seperator` embeddings |
+| Sequence splice | `<image>` placeholder = token id **128815**, embeddings masked-scatter'd in; grid layout with newline token per row; global view + local crop views |
+| Tokenizer | BPE (`gpt2`-family, `deepseek-v3` pre), 129,280 vocab · chat template = **trivial passthrough** (`{% for m in messages %}{{m['content']}}{% endfor %}`) — prompts are raw DeepSeek-OCR style (`<image>\n<|grounding|>Convert the document to markdown.`) |
+| KV cache | **constant**: (prefill_len + 128) slots × 12 layers × 1280 × 2 × f16 ≈ **61 KB/slot** → single page ≈ 90 MB, *independent of output length* |
+
+### Op-gap table — custom-WGSL engine path (Path B, recommended)
+
+| Op / capability | Engine today | Gap | Effort |
+|---|---|---|---|
+| MHA + RoPE + RMSNorm + SiLU FFN | ✅ Qwen3 path (attn 1/√d, rope, rms_norm, silu_mul) | none — config flags only (`qk_norm: false`) | ~0 |
+| Untied lm_head, large vocab | ✅ (Qwen3-8B: untied, chunked embed decode) | none | 0 |
+| **MoE block** | ❌ dense only | router GEMV (tiny, F32) + **softmax-top-6 kernel** (64 logits, 1 workgroup) + **expert-indexed GEMV** (matmul_q4k_mr + expert-offset read from a GPU buffer — no CPU readback) + scaled-accumulate; shared expert = existing FFN at I=1792; layer-0 dense = existing | **3–5 days** incl. crossLabDiff green |
+| **Ring-buffer KV (R-SWA)** | sliding-window plumbing exists (Gemma), but mask-based, not ring | slot-index write in kv_cache_store + fixed attn length P+128; **deferrable — ≤128-token outputs are exactly causal** | 2–3 days (phase 2) |
+| `inputs_embeds` injection (vision tokens) | ❌ token-id lookup only | prefill path that copies precomputed 1280-dim rows from a GPU buffer instead of embedding_lookup | ~1 day |
+| Q5_0 source dequant (`ffn_down_exps`) | ❌ (F32/F16/BF16/Q8_0/Q4_K/Q5_K/Q6_K) | ~30-line decoder in gguf.ts | hours |
+| 3-D expert tensor upload | per-2D-tensor buffers | one buffer per exps tensor + expert stride (gate_exps Q4_K ≈ 41 MB/layer — trivially under the 4 GB buffer cap) | in MoE item |
+| Batched prefill | ❌ token-at-a-time (M=1 engine) | OCR prefill ≈ 300–1500 tokens → ~5–15 s/page at decode speed; acceptable for prototype, batch later | later opt |
+| **Vision stack in WGSL** | ❌ (no conv2d, LayerNorm+bias, window-attn, rel-pos) | full SAM+CLIP+projector port | **2–3 wks (defer)** |
+| Vision via ORT-web hybrid | lab already drives raw ORT-web | export DeepEncoder-only to ONNX fp16 (plain PyTorch vision graph, no cache/MoE/custom-attn → standard `torch.onnx.export` territory; bicubic pos-embed interp precomputed at export) + JS glue: ORT output → GPU buffer → engine | **3–5 days** |
+
+**Path A (ONNX/transformers.js@4) assessment:** upstream has the ops — v4.0.0 ships **QMoE** (`com.microsoft.QMoE`), MLA (unneeded here), **DeepSeek-V3 arch** (PR #1586, architecture-only), and OCR-VLM precedent (GLM-OCR, LightOnOCR). No `deepseek-ocr`/`unlimited-ocr` arch in transformers.js and no optimum export recipe — the work is a hand-written export (decoder w/ past_kv + QMoE insertion + vision graph) plus a transformers.js model class; R-SWA lives outside the graph as JS-side KV eviction (the decode loop already feeds `past_key_values` explicitly, so eviction is tensor slicing between steps). Estimate **2–4 weeks**, most of it export tooling — and it duplicates what the GGUF path gets for free. **Decision: Path B first; Path A only as an upstream contribution later** (it's the LocalMind drop-in shape, worth doing once the kernels prove the model).
+
+### Quantization plan
+
+- **Consume the community imatrix quants as-is** (they're calibrated; `Unlimited-OCR.imatrix` published). Q4_K_M mix: attn/gate/up Q4_K, `ffn_down_exps` Q5_0, some attn_v/output Q6_K, router F32. The engine requants source→F16→in-shader q4k for layer matmuls; the Q5_0→q4k double-quant is the only added loss — measure via crossLabDiff, fall back to in-shader q8 for down_exps if the cliff shows there.
+- Budget check: layer weights in-shader q4k ≈ 1.2 GB + embed/lm_head F16 662 MB + vision 812 MB ≈ **2.7 GB GPU weights + ~90 MB constant KV** — inside the 4 GB single-buffer ceiling with room, and a 24 GB laptop doesn't blink. Embeddings/lm_head → q8 later if the sidecar slice demands it.
+- Accuracy gate (lab hard rule): CPU-reference harness — `deepseek_ocr_smoke.py` mirroring `reference/pytorch/qwen3_smoke.py` (HF `trust_remote_code` bf16, text-only prompt, layer-by-layer npz) → crossLabDiff green before any browser claim.
+- Speed envelope: ~570 M active params/token (label `64x550M` ✓ my per-tensor arithmetic) ≈ 0.35 GB reads/token at q4k — **⅓ of Qwen3-1.7B's per-token traffic**, same-machine anchor 40 tok/s → **40–80 tok/s class** expected (MoE gather overhead is the unknown); even the floor transcribes a dense page (~1000 tokens) in ~25 s, decode speed flat in document length thanks to constant KV.
+
+### Prototype ladder (smallest end-to-end proof)
+
+- **P0 — decoder-only text smoke** (no vision): `deepseek2-ocr` config + loader mapping + MoE kernels + Q5_0 decoder → greedy decode from a text prompt, crossLabDiff vs HF bf16 reference. *This is the go/no-go kernel milestone.* ~1 wk.
+- **P1 — vision hybrid**: DeepEncoder → ONNX fp16 → ORT-web session → projector output → `inputs_embeds` injection → **single-page 1024px OCR on WebGPU**, ≤128-token output (R-SWA ≡ causal, no ring needed). ~1 wk.
+- **P2 — long-doc**: ring-buffer KV + batched prefill → multi-page one-shot parse, the constant-KV headline nobody else has in-browser. ~1 wk.
+- **P3 — publish**: HF `naklitechie/` (MIT upstream, notice retained) — engine-ready GGUF mirror + ONNX vision graph + demo page; candidate spin-off as its own public repo.
+
+### Caveats / watch items
+
+- The GGUFs require llama.cpp **PR #17400** (unmerged); if upstream lands different tensor naming/arch key, re-convert — our loader keys on the current names. The BF16 GGUF (5.88 GB) in the same repo is the requant fallback.
+- Arch is 3 weeks old; watch for Unlimited-OCR v1.x re-releases (Baidu iterates fast) and for transformers.js adding the family upstream (would hand us Path A cheaply — recheck at P1).
+- Engine tokenizer: byte-level BPE `Ġ` handling is the already-tracked weak layer; DeepSeek-V3 pre-tokenizer regex needs porting care (OCR outputs are markdown-heavy — spacing bugs will show).
+- Vision preprocessing (resize to 1024², normalize mean/std 0.5, tiling for multi-page) lives in JS canvas — mechanical but must match `processor_config.json` exactly.
